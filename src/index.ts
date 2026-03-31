@@ -4,13 +4,20 @@ import nodemailer from 'nodemailer'
 
 export const name = 'napcat-status'
 
+interface OneBotGroupData {
+  group_id: number
+  group_name: string
+  member_count?: number
+  max_member_count?: number
+}
+
 interface OneBotStatusData {
-  online: boolean
-  good: boolean
-  stat: Record<string, unknown>
+  online?: boolean
+  good?: boolean
 }
 
 interface OneBotInternal {
+  getGroupList?: (noCache?: boolean | string) => Promise<OneBotGroupData[]>
   getStatus?: () => Promise<OneBotStatusData>
 }
 
@@ -63,7 +70,8 @@ export const Config: Schema<Config> = Schema.object({
 
 interface StatusSnapshot {
   bot: OneBotRuntimeBot
-  data?: OneBotStatusData
+  data?: OneBotGroupData[]
+  statusData?: OneBotStatusData
   error?: string
 }
 
@@ -86,37 +94,32 @@ function formatKoishiStatus(status: Status) {
   }
 }
 
-function formatValue(value: unknown) {
-  if (typeof value === 'string') return value
-  if (typeof value === 'number' || typeof value === 'boolean' || value == null) return String(value)
-  return JSON.stringify(value)
-}
-
-function formatStat(stat: Record<string, unknown>) {
-  const entries = Object.entries(stat)
-  if (!entries.length) return '{}'
-  return entries
-    .map(([key, value]) => `${key}: ${formatValue(value)}`)
-    .join(', ')
-}
-
 function resolveBots(ctx: Context) {
   return ctx.bots.filter(isOneBotRuntimeBot)
 }
 
-async function queryStatus(bot: OneBotRuntimeBot): Promise<StatusSnapshot> {
-  const getStatus = bot.internal?.getStatus
+function isKoishiUnavailable(status: Status) {
+  return status !== Status.ONLINE && status !== Status.CONNECT
+}
 
-  if (typeof getStatus !== 'function') {
+async function queryStatus(bot: OneBotRuntimeBot): Promise<StatusSnapshot> {
+  const internal = bot.internal
+  const getGroupList = internal?.getGroupList
+  const getStatus = internal?.getStatus
+
+  if (typeof getGroupList !== 'function') {
     return {
       bot,
-      error: '适配器连接未暴露 getStatus 接口。',
+      error: '适配器连接未暴露 getGroupList 接口。',
     }
   }
 
   try {
-    const data = await getStatus.call(bot.internal)
-    return { bot, data }
+    const data = await internal.getGroupList(true)
+    const statusData = typeof getStatus === 'function'
+      ? await internal.getStatus()
+      : undefined
+    return { bot, data, statusData }
   } catch (error) {
     return {
       bot,
@@ -130,14 +133,18 @@ async function queryStatuses(bots: OneBotRuntimeBot[]) {
 }
 
 function isAbnormal(snapshot: StatusSnapshot) {
-  return !!snapshot.error || snapshot.data?.online !== true
+  return !!snapshot.error
+    || !Array.isArray(snapshot.data)
+    || isKoishiUnavailable(snapshot.bot.status)
+    || snapshot.statusData?.online === false
 }
 
 function getAlertKey(snapshots: StatusSnapshot[]) {
   return snapshots
     .map((snapshot) => {
       if (snapshot.error) return `${snapshot.bot.selfId}:error:${snapshot.error}`
-      return `${snapshot.bot.selfId}:online:${snapshot.data.online}`
+      if (snapshot.statusData?.online === false) return `${snapshot.bot.selfId}:online:false`
+      return `${snapshot.bot.selfId}:group-count:${snapshot.data.length}`
     })
     .sort()
     .join('|')
@@ -162,11 +169,16 @@ function createMailText(snapshots: StatusSnapshot[]) {
     lines.push(`账号: ${snapshot.bot.selfId}`)
     lines.push(`Koishi 状态: ${formatKoishiStatus(snapshot.bot.status)}`)
     if (snapshot.error) {
-      lines.push(`结果: 获取状态失败 (${snapshot.error})`)
+      lines.push(`结果: 获取群列表失败 (${snapshot.error})`)
+    } else if (snapshot.statusData?.online === false) {
+      lines.push('结果: OneBot 状态离线')
+      lines.push(`群数量: ${snapshot.data.length}`)
+    } else if (isKoishiUnavailable(snapshot.bot.status)) {
+      lines.push('结果: Koishi 连接状态异常')
+      lines.push(`群数量: ${snapshot.data.length}`)
     } else {
-      lines.push(`OneBot 在线: ${snapshot.data.online ? '是' : '否'}`)
-      lines.push(`OneBot 健康: ${snapshot.data.good ? '是' : '否'}`)
-      lines.push(`统计信息: ${formatStat(snapshot.data.stat)}`)
+      lines.push(`结果: 可获取群列表`)
+      lines.push(`群数量: ${snapshot.data.length}`)
     }
     lines.push('')
   }
@@ -179,6 +191,7 @@ export function apply(ctx: Context, config: Config) {
   let checking = false
   let lastAlertAt = 0
   let lastAlertKey = ''
+  let hasAbnormal = false
 
   const checkAllBots = async () => {
     if (!config.monitor.enable) return
@@ -195,15 +208,25 @@ export function apply(ctx: Context, config: Config) {
 
       for (const snapshot of snapshots) {
         if (snapshot.error) {
-          logger.warn(`账号 ${snapshot.bot.selfId} 获取状态失败: ${snapshot.error}`)
+          logger.warn(`账号 ${snapshot.bot.selfId} 获取群列表失败: ${snapshot.error}`)
+        } else if (snapshot.statusData?.online === false) {
+          logger.warn(`账号 ${snapshot.bot.selfId} OneBot 状态离线`)
+        } else if (isKoishiUnavailable(snapshot.bot.status)) {
+          logger.warn(`账号 ${snapshot.bot.selfId} Koishi 状态异常: ${formatKoishiStatus(snapshot.bot.status)}`)
         }
       }
 
       if (!abnormal.length) {
+        if (hasAbnormal) {
+          logger.info('账号状态已恢复，可正常获取群列表。')
+        }
+        hasAbnormal = false
         lastAlertAt = 0
         lastAlertKey = ''
         return
       }
+
+      hasAbnormal = true
 
       if (!canSendMail(config.mail)) {
         logger.warn('检测到异常账号，但邮件告警配置不完整或未启用。')
