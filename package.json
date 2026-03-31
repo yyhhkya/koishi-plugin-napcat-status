@@ -1,7 +1,10 @@
 {
   "name": "@yyhhkya/koishi-plugin-napcat-status",
-  "description": "",
+  "description": "在onebot掉线时发送通知",
   "version": "0.0.2",
+  "contributors": [
+    "Yy <1163635725@qq.com>"
+  ],
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -9,6 +12,10 @@
     "dist"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yyhhkya/koishi-plugin-napcat-status.git"
+  },
   "keywords": [
     "chatbot",
     "koishi",
