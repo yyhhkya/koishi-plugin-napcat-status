@@ -1,7 +1,7 @@
 {
   "name": "@yyhhkya/koishi-plugin-napcat-status",
   "description": "在onebot掉线时发送通知",
-  "version": "0.0.3",
+  "version": "0.1.0",
   "contributors": [
     "Yy <1163635725@qq.com>"
   ],

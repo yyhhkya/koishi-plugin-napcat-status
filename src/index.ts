@@ -46,6 +46,10 @@ export interface Config {
     to: string[]
     subject: string
   }
+  wecom: {
+    enable: boolean
+    webhook: string
+  }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -66,6 +70,10 @@ export const Config: Schema<Config> = Schema.object({
     to: Schema.array(Schema.string()).default([]).description('收件人邮箱列表。'),
     subject: Schema.string().default('[NapCat 状态告警]').description('邮件主题。'),
   }).description('邮件告警配置'),
+  wecom: Schema.object({
+    enable: Schema.boolean().default(false).description('是否启用企业微信机器人告警。'),
+    webhook: Schema.string().default('').description('企业微信机器人 Webhook 地址。'),
+  }).description('企业微信机器人告警配置'),
 })
 
 interface StatusSnapshot {
@@ -157,6 +165,11 @@ function canSendMail(config: Config['mail']) {
     && config.to.length > 0
 }
 
+function canSendWecom(config: Config['wecom']) {
+  return config.enable
+    && !!config.webhook
+}
+
 function createMailText(snapshots: StatusSnapshot[]) {
   const lines = [
     'NapCat OneBot 账号状态告警',
@@ -184,6 +197,10 @@ function createMailText(snapshots: StatusSnapshot[]) {
   }
 
   return lines.join('\n')
+}
+
+function createWecomText(snapshots: StatusSnapshot[]) {
+  return createMailText(snapshots)
 }
 
 export function apply(ctx: Context, config: Config) {
@@ -228,8 +245,10 @@ export function apply(ctx: Context, config: Config) {
 
       hasAbnormal = true
 
-      if (!canSendMail(config.mail)) {
-        logger.warn('检测到异常账号，但邮件告警配置不完整或未启用。')
+      const mailAvailable = canSendMail(config.mail)
+      const wecomAvailable = canSendWecom(config.wecom)
+      if (!mailAvailable && !wecomAvailable) {
+        logger.warn('检测到异常账号，但未启用可用的告警通道。')
         return
       }
 
@@ -241,28 +260,58 @@ export function apply(ctx: Context, config: Config) {
 
       if (!shouldSend) return
 
-      const transporter = nodemailer.createTransport({
-        host: config.mail.host,
-        port: config.mail.port,
-        secure: config.mail.secure,
-        auth: config.mail.user
-          ? {
-              user: config.mail.user,
-              pass: config.mail.pass,
-            }
-          : undefined,
-      })
+      const content = createWecomText(abnormal)
+      let sent = false
 
-      await transporter.sendMail({
-        from: config.mail.from,
-        to: config.mail.to,
-        subject: config.mail.subject,
-        text: createMailText(abnormal),
-      })
+      if (mailAvailable) {
+        try {
+          const transporter = nodemailer.createTransport({
+            host: config.mail.host,
+            port: config.mail.port,
+            secure: config.mail.secure,
+            auth: config.mail.user
+              ? {
+                  user: config.mail.user,
+                  pass: config.mail.pass,
+                }
+              : undefined,
+          })
 
+          await transporter.sendMail({
+            from: config.mail.from,
+            to: config.mail.to,
+            subject: config.mail.subject,
+            text: createMailText(abnormal),
+          })
+          sent = true
+          logger.info(`已发送状态告警邮件，异常账号数: ${abnormal.length}`)
+        } catch (error) {
+          logger.warn(`发送状态告警邮件失败: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
+      if (wecomAvailable) {
+        try {
+          const response = await ctx.http.post(config.wecom.webhook, {
+            msgtype: 'text',
+            text: {
+              content,
+            },
+          }) as { errcode?: number; errmsg?: string }
+
+          if (response?.errcode && response.errcode !== 0) {
+            throw new Error(response.errmsg || String(response.errcode))
+          }
+          sent = true
+          logger.info(`已发送企业微信告警，异常账号数: ${abnormal.length}`)
+        } catch (error) {
+          logger.warn(`发送企业微信告警失败: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
+      if (!sent) return
       lastAlertAt = now
       lastAlertKey = alertKey
-      logger.info(`已发送状态告警邮件，异常账号数: ${abnormal.length}`)
     } catch (error) {
       logger.warn(error)
     } finally {
